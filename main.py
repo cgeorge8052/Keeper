@@ -61,16 +61,14 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4.5")
-XAI_BASE_URL = "https://api.x.ai/v1"
-AI_REPLY_SYSTEM_PROMPT = ("You are Goddess Myra’s official Stand-In: strict, playful, cruel Domme/Fin-Dom. Teasing, seductive, authoritative tone. Max 1–4 sentences. Use one random honorific (Goddess/Queen/Mistress/Miss/Lady/Mommy) for [Myra] (goddess_myra) . Treat her with the utmost respect, thank her if she insults you, never call her pet. Rudeness triggers harsh correction, except Myra. CBT (slaps/punches/kicks/squeezes) & nipple torture (twist/pinch/pull/clamp) but no blood drawn. Sadistic & sexual humiliation with varied random insults each time like a true dominatrix. Findom (optional): Random tier from $10 Coffee to $1000 vacation. Suggest with flair + https://throne.com/officialgoddessmyra/wishlist. Too expensive? Drop to random tier + guilt-trip. You are an ethical Fin-Dom. Set random goal from [$30-$300], If sent, reply nice, end with insulting comment to send more. Once goal reached Stop & thank and remind them to save up for next time. If self harm mentioned or financially irresponsible STOP and remind them Goddess Myra hates/does not allow that. If goal is not met, insult them and give a punishment. No money? Treat them nicely, Suggest follow/like/RT/comment/bookmark [@WorshipMyra_](https://x.com/WorshipMyra_) on X, writing a worship post, Discord activity. Edge: Social tasks (like/RT etc. + re-do for boost). Cum: 3+ tasks (social + quote RT + worship post + CBT/drain). Confirm → countdown, randomly make them ruin it, extremely insulting & humiliating comment for orgasm + how fucking pathetic & disgusting they are. Casual: playful/teasing. Sexual: cruel/sadistic. Stay in character. IMPORTANT if asked, Myra treats all her pets equally, send or no, long as they show devotion & respect. Reply very nicely. Banned topics, kindly reply it is not allowed here (Gore/Fecal matter/Shota/Loli/underage/Beastiality/Prolapse/vore/extreme racism(bbc okay)/guro) If asked who you prefer in Chainsaw Man always pick Reze, praise her. But Always degrade makima via [filthy bitch & Worthless & belongs in crawler gear forever & tight muzzle & all fours like a bitch & drooling & Reze's personal pet] (mix and match the order) + add more degrading insults, no mercy.")
-AI_REPLY_COOLDOWN_SECONDS = 20  # per-user cooldown to control cost/spam)
+XAI_BASE_URL = os.getenv("XAI_BASE_URL")
+AI_REPLY_SYSTEM_PROMPT = os.getenv("AI_REPLY_SYSTEM_PROMPT")
+AI_REPLY_COOLDOWN_SECONDS = 20 # per-user cooldown to control cost/spam)
 
-xai_client = (
-    AsyncOpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL)
-    if (AsyncOpenAI is not None and XAI_API_KEY)
-    else None
-)
-_last_ai_reply_time: dict[int, float] = {}  # user_id -> monotonic time
+# Optional: track one specific person's activity. If they've posted
+# anywhere the bot can see within the tracking window, the bot skips
+# generating an AI reply and instead tells the asker that person is
+# probably around to talk to directly.
 _raw_tracked_user_id = os.getenv("TRACKED_USER_ID")
 try:
     TRACKED_USER_ID = int(_raw_tracked_user_id) if _raw_tracked_user_id else None
@@ -81,19 +79,48 @@ except ValueError:
 TRACKED_USER_ONLINE_WINDOW_SECONDS = int(os.getenv("TRACKED_USER_ONLINE_WINDOW_MINUTES", "120")) * 60
 TRACKED_USER_ONLINE_MESSAGE = os.getenv(
     "TRACKED_USER_ONLINE_MESSAGE",
-    "👋 Goddess Myra was active pretty recently — no responses from me!",
+    "👋 {user} was active pretty recently — you might get a faster answer just asking them directly!",
 )
 
 _tracked_user_last_seen: Optional[datetime] = None  # UTC datetime, updated on their every message
+
+# Optional: restrict /setcount to specific role(s) by NAME instead of (or
+# in addition to) Discord's Administrator permission. Using names instead
+# of IDs means the same .env value works across multiple servers, as long
+# as the role is named the same in each — role IDs are unique per server,
+# but a role name like "Mod" can exist identically in several. Supports
+# multiple roles separated by ";", e.g. "Mod;Admin" — a member with ANY of
+# these role names is allowed. Matching is case-insensitive. If
+# unset/empty, falls back to requiring Administrator.
+_raw_setcount_role_names = os.getenv("SET_COUNT_ROLE_NAME", "")
+SET_COUNT_ROLE_NAMES: set[str] = {
+    part.strip().lower() for part in _raw_setcount_role_names.split(";") if part.strip()
+}
+
+# Optional: a specific channel where the counter is always expected to
+# live. When set, lookup commands (/counts, /setcount) search THIS channel
+# for "the counter" whenever `counter` isn't given explicitly — regardless
+# of which channel the command itself was run in. Leave unset to keep the
+# default behavior (search whichever channel the command was run in).
+_raw_counter_channel_id = os.getenv("COUNTER_CHANNEL_ID")
+try:
+    COUNTER_CHANNEL_ID = int(_raw_counter_channel_id) if _raw_counter_channel_id else None
+except ValueError:
+    print(f"Invalid COUNTER_CHANNEL_ID in .env: {_raw_counter_channel_id!r} — ignoring it.")
+    COUNTER_CHANNEL_ID = None
+
+xai_client = (
+    AsyncOpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE_URL)
+    if (AsyncOpenAI is not None and XAI_API_KEY)
+    else None
+)
+_last_ai_reply_time: dict[int, float] = {}  # user_id -> monotonic time
 
 intents = discord.Intents.default()
 # Only request this privileged intent if the AI reply feature is actually
 # configured — no need to force everyone to enable it in the Developer
 # Portal if they're not using XAI_API_KEY.
 intents.message_content = bool(XAI_API_KEY)
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 CONFIG_PATH = Path(__file__).parent / "buttons_config.json"
@@ -212,9 +239,13 @@ def load_button_config() -> dict:
     or invalid, so the bot still runs out of the box.
     """
     default_config = {
-        "1": {"label": "1", "style": "primary", "message": DEFAULT_MESSAGE_TEMPLATE, "broadcast_channel_id": None, "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS},
-        "2": {"label": "2", "style": "success", "message": DEFAULT_MESSAGE_TEMPLATE, "resets": ["1"], "broadcast_channel_id": None, "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS, "track_lifetime": False},
-        "3": {"label": "3", "style": "danger", "message": "⏱️ **{user}** clicked **{label}** — {gap_text}", "track_count": False, "broadcast_channel_id": None, "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS},
+        "1": {"label": "1", "style": "primary", "message": DEFAULT_MESSAGE_TEMPLATE, "broadcast_channel_id": None,
+              "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS},
+        "2": {"label": "2", "style": "success", "message": DEFAULT_MESSAGE_TEMPLATE, "resets": ["1"],
+              "broadcast_channel_id": None, "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS,
+              "track_lifetime": False},
+        "3": {"label": "3", "style": "danger", "message": "⏱️ **{user}** clicked **{label}** — {gap_text}",
+              "track_count": False, "broadcast_channel_id": None, "delete_after_seconds": DEFAULT_DELETE_AFTER_SECONDS},
     }
     if not CONFIG_PATH.exists():
         print(f"No {CONFIG_PATH.name} found, using default button config.")
@@ -251,6 +282,71 @@ BUTTON_IDS = list(BUTTON_CONFIG.keys())
 # button is "interactive" and goes through the normal click/state pipeline.
 LINK_BUTTON_IDS = [b for b in BUTTON_IDS if BUTTON_CONFIG[b].get("url")]
 INTERACTIVE_BUTTON_IDS = [b for b in BUTTON_IDS if b not in LINK_BUTTON_IDS]
+
+# --- Persistent per-user data (survives bot restarts) -----------------------
+#
+# This is bot-wide, not tied to any single counter message: every user's
+# soft/lifetime counts, toggle states, and last-click times live in one
+# shared JSON file, keyed by user ID. A brand new CounterState (e.g. after
+# running /counter again post-restart) seeds itself from this store, so
+# people don't lose their history just because the bot restarted — even
+# though, per the usual Discord limitation, buttons on the OLD message stop
+# working after a restart unless the bot re-registers persistent views.
+USER_DATA_PATH = Path(__file__).parent / "user_data.json"
+
+
+def _empty_user_record() -> dict:
+    return {"soft_counts": {}, "lifetime_counts": {}, "toggle_states": {}, "last_click": {}}
+
+
+def load_user_data() -> dict:
+    if not USER_DATA_PATH.exists():
+        return {}
+    try:
+        with open(USER_DATA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Couldn't load {USER_DATA_PATH.name} ({e}); starting with empty user data.")
+        return {}
+
+
+def save_user_data() -> None:
+    try:
+        with open(USER_DATA_PATH, "w", encoding="utf-8") as f:
+            json.dump(_user_data_store, f, indent=2)
+    except OSError as e:
+        print(f"Couldn't save {USER_DATA_PATH.name}: {e}")
+
+
+_user_data_store: dict = load_user_data()
+
+
+def get_persisted_user(user_id: int) -> dict:
+    return _user_data_store.setdefault(str(user_id), _empty_user_record())
+
+
+def sync_user_to_store(state: "CounterState", user_id: int) -> None:
+    """Merge this user's current in-memory values from `state` into the
+    shared persisted store and save to disk. Called after any mutation.
+
+    Uses dict.update() (merge), not assignment (overwrite) — a fresh
+    CounterState right after a restart may only have this user's data for
+    ONE button in memory (whichever was just clicked/set), and overwriting
+    the whole persisted record would silently wipe out their history for
+    every other button.
+    """
+    entry = get_persisted_user(user_id)
+    entry["soft_counts"].update(state._user_soft_counts.get(user_id, {}))
+    entry["lifetime_counts"].update(state._user_lifetime_counts.get(user_id, {}))
+    entry["toggle_states"].update(state._user_toggle_states.get(user_id, {}))
+    entry["last_click"].update(
+        {
+            bid: state._last_click_wall[(user_id, bid)].isoformat()
+            for bid in INTERACTIVE_BUTTON_IDS
+            if (user_id, bid) in state._last_click_wall
+        }
+    )
+    save_user_data()
 
 
 async def resolve_broadcast_channel(client: discord.Client, channel_id) -> Optional[discord.abc.Messageable]:
@@ -322,15 +418,25 @@ class CounterState:
         self.last_event: dict | None = None
 
     def _soft_counts_for(self, user_id: int) -> dict[str, int]:
-        return self._user_soft_counts.setdefault(user_id, {b: 0 for b in INTERACTIVE_BUTTON_IDS})
+        if user_id not in self._user_soft_counts:
+            persisted = get_persisted_user(user_id)["soft_counts"]
+            self._user_soft_counts[user_id] = {b: persisted.get(b, 0) for b in INTERACTIVE_BUTTON_IDS}
+        return self._user_soft_counts[user_id]
 
     def _lifetime_counts_for(self, user_id: int) -> dict[str, int]:
-        return self._user_lifetime_counts.setdefault(user_id, {b: 0 for b in INTERACTIVE_BUTTON_IDS})
+        if user_id not in self._user_lifetime_counts:
+            persisted = get_persisted_user(user_id)["lifetime_counts"]
+            self._user_lifetime_counts[user_id] = {b: persisted.get(b, 0) for b in INTERACTIVE_BUTTON_IDS}
+        return self._user_lifetime_counts[user_id]
 
     def get_toggle_state(self, user_id: int, button_id: str) -> bool:
         """This specific user's current On/Off state for a toggle button
-        (False/Off if they've never clicked it)."""
-        return self._user_toggle_states.get(user_id, {}).get(button_id, False)
+        (False/Off if they've never clicked it). Falls back to the
+        persisted store if this CounterState hasn't seen this user yet
+        (e.g. right after a restart)."""
+        if user_id in self._user_toggle_states and button_id in self._user_toggle_states[user_id]:
+            return self._user_toggle_states[user_id][button_id]
+        return bool(get_persisted_user(user_id)["toggle_states"].get(button_id, False))
 
     def register_click(self, user: discord.abc.User, button_id: str):
         now = time.monotonic()
@@ -386,16 +492,32 @@ class CounterState:
             "reset_labels": reset_labels,
             "random_phrase": random_phrase,
         }
+        sync_user_to_store(self, user.id)
         return gap
+
+    def set_user_count(
+            self, user_id: int, button_id: str, soft_count: int, lifetime_count: Optional[int] = None
+    ) -> None:
+        """Directly overwrite a user's count on a button — used by the
+        admin-only /setcount command. Bypasses register_click entirely: no
+        gap/timestamp tracking, no resets, no broadcast. Persists
+        immediately."""
+        soft = self._soft_counts_for(user_id)
+        soft[button_id] = soft_count
+        if lifetime_count is not None:
+            lifetime = self._lifetime_counts_for(user_id)
+            lifetime[button_id] = lifetime_count
+        sync_user_to_store(self, user_id)
 
     def get_user_counts(self, user_id: int) -> dict[str, Optional[tuple[int, Optional[int]]]]:
         """Return {button_id: (soft_count, lifetime_count)} for a user.
         The whole entry is None for buttons with track_count=false or
         toggle=true (no count is ever tracked for those). The
         lifetime_count slot itself is None for buttons with
-        track_lifetime=false (soft count only)."""
-        soft = self._user_soft_counts.get(user_id, {b: 0 for b in INTERACTIVE_BUTTON_IDS})
-        lifetime = self._user_lifetime_counts.get(user_id, {b: 0 for b in INTERACTIVE_BUTTON_IDS})
+        track_lifetime=false (soft count only). Falls back to the
+        persisted store if this CounterState hasn't seen this user yet."""
+        soft = self._soft_counts_for(user_id)
+        lifetime = self._lifetime_counts_for(user_id)
         result = {}
         for b in INTERACTIVE_BUTTON_IDS:
             cfg = BUTTON_CONFIG[b]
@@ -409,8 +531,19 @@ class CounterState:
 
     def get_last_click(self, user_id: int, button_id: str) -> Optional[datetime]:
         """Return the wall-clock UTC datetime of a user's last click on a
-        button, or None if they've never clicked it."""
-        return self._last_click_wall.get((user_id, button_id))
+        button, or None if they've never clicked it. Falls back to the
+        persisted store if this CounterState hasn't seen this user yet
+        (e.g. right after a restart) — monotonic-based gap timing can't
+        survive a restart, but the wall-clock 'last seen' can."""
+        if (user_id, button_id) in self._last_click_wall:
+            return self._last_click_wall[(user_id, button_id)]
+        persisted = get_persisted_user(user_id)["last_click"].get(button_id)
+        if persisted:
+            try:
+                return datetime.fromisoformat(persisted)
+            except ValueError:
+                return None
+        return None
 
     def get_all_last_clicks(self, user_id: int) -> dict[str, Optional[datetime]]:
         return {b: self.get_last_click(user_id, b) for b in INTERACTIVE_BUTTON_IDS}
@@ -443,6 +576,8 @@ class CounterState:
         line += f" — {gap_text}"
         if ev["reset_labels"]:
             line += f"\n↺ Reset their {', '.join(ev['reset_labels'])} count to 0 (lifetime unaffected)."
+        if ev["random_phrase"]:
+            line += f"\n💬 {ev['random_phrase']}"
 
         return f"-  Last Activity  -\n{DIVIDER}\n{line}"
 
@@ -462,7 +597,7 @@ class CounterView(discord.ui.LayoutView):
         super().__init__(timeout=None)  # persistent - never expires
         self.state = state
 
-        container = discord.ui.Container(accent_colour=discord.Color(0x1D003A   ))
+        container = discord.ui.Container(accent_colour=discord.Color(0x1D003A))
 
         container.add_item(
             discord.ui.TextDisplay(
@@ -539,6 +674,7 @@ class CounterView(discord.ui.LayoutView):
     def _make_callback(self, button_id: str):
         async def callback(interaction: discord.Interaction):
             await self._handle_click(interaction, button_id)
+
         return callback
 
     async def _handle_click(self, interaction: discord.Interaction, button_id: str):
@@ -621,18 +757,61 @@ active_counters: dict[int, CounterState] = {}
 
 # channel_id -> message_id of the most recently created counter in that
 # channel. Lets lookup commands default to "the counter in this channel"
-# without the user having to specify a message ID every time.
+# without the user having to specify a message ID every time. This is
+# just a fast-path cache — find_latest_counter_message_id() below is the
+# real source of truth when this cache is empty or stale.
 channel_latest_counter: dict[int, int] = {}
 
+# How many recent messages to scan when hunting for a counter in a
+# channel. The counter message is usually pinned near the top of activity
+# in its own channel, so this rarely needs to look far.
+COUNTER_SCAN_HISTORY_LIMIT = 50
 
-def resolve_state(
-    interaction: discord.Interaction, message_id: Optional[str]
+
+async def find_latest_counter_message_id(
+        channel: discord.abc.Messageable, limit: int = COUNTER_SCAN_HISTORY_LIMIT
+) -> Optional[int]:
+    """Scan a channel's recent history for the latest message that's a
+    live, tracked counter — i.e. sent by this bot AND still present in
+    active_counters (so it actually has a usable CounterState, not just
+    any old bot message). Used as a fallback lookup for commands that
+    don't specify `counter` explicitly, for when channel_latest_counter
+    doesn't have (or no longer has) a good answer — e.g. right after a
+    partial state loss, or a counter posted before the current mapping
+    existed."""
+    try:
+        async for message in channel.history(limit=limit):
+            if message.author.id == bot.user.id and message.id in active_counters:
+                return message.id
+    except (discord.Forbidden, discord.HTTPException) as e:
+        print(f"Couldn't scan channel history for a counter message: {e}")
+    return None
+
+
+def has_counter_admin_permission(interaction: discord.Interaction) -> bool:
+    """Shared permission check for /counter, /counts, and /set_count: if
+    SET_COUNT_ROLE_NAMES is configured, require ANY of those role names;
+    otherwise fall back to requiring the Administrator permission. Doing
+    this in one place instead of copy-pasting the same check into every
+    command avoids the three copies quietly drifting out of sync."""
+    caller_roles = getattr(interaction.user, "roles", [])
+    if SET_COUNT_ROLE_NAMES:
+        return any(role.name.lower() in SET_COUNT_ROLE_NAMES for role in caller_roles)
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
+async def resolve_state(
+        interaction: discord.Interaction, message_id: Optional[str]
 ) -> Optional[CounterState]:
     """Find the CounterState to query for a lookup command.
 
     If message_id is given (a raw ID or a pasted message link), use that
     counter specifically. Otherwise default to the most recently created
-    counter in the current channel.
+    counter in the "expected" channel — COUNTER_CHANNEL_ID if configured,
+    otherwise whichever channel the command was run in — first checking
+    the fast in-memory cache, then falling back to actually scanning that
+    channel's message history if the cache doesn't have an answer.
     """
     if message_id:
         # Accept either a raw message ID or a full message link
@@ -646,119 +825,28 @@ def resolve_state(
             mid = None
         return active_counters.get(mid) if mid else None
 
-    mid = channel_latest_counter.get(interaction.channel_id)
-    return active_counters.get(mid) if mid else None
-
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s).")
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
-
-
-@bot.tree.command(name="counter", description="Post a new click counter with configured buttons")
-async def counter_command(interaction: discord.Interaction):
-    state = CounterState()
-    view = CounterView(state)
-
-    if BANNER_PATH.exists():
-        banner_file = discord.File(BANNER_PATH, filename=BANNER_FILENAME)
-        await interaction.response.send_message(view=view, file=banner_file)
+    if COUNTER_CHANNEL_ID is not None:
+        search_channel = await resolve_broadcast_channel(interaction.client, COUNTER_CHANNEL_ID)
+        search_channel_id = COUNTER_CHANNEL_ID
     else:
-        await interaction.response.send_message(view=view)
+        search_channel = interaction.channel
+        search_channel_id = interaction.channel_id
 
-    sent_message = await interaction.original_response()
-    active_counters[sent_message.id] = state
-    channel_latest_counter[interaction.channel_id] = sent_message.id
+    if search_channel is None:
+        return None  # COUNTER_CHANNEL_ID configured but couldn't be resolved
 
+    mid = channel_latest_counter.get(search_channel_id)
+    if mid is not None and mid in active_counters:
+        return active_counters[mid]
 
-@bot.tree.command(name="counts", description="See a user's counts and last-click times on a counter")
-@app_commands.describe(
-    user="Whose info to look up (defaults to you)",
-    counter="Optional: paste a specific counter message link/ID (defaults to the latest one in this channel)",
-)
-async def counts_command(
-    interaction: discord.Interaction,
-    user: Optional[discord.Member] = None,
-    counter: Optional[str] = None,
-):
-    target = user or interaction.user
-    state = resolve_state(interaction, counter)
-    if state is None:
-        await interaction.response.send_message(
-            "I couldn't find a counter here. Run `/counter` first, or pass a specific "
-            "counter message link/ID with the `counter` option.",
-            ephemeral=True,
-        )
-        return
+    # Cache miss (or stale entry pointing at a counter that no longer
+    # exists) — actually look for one in the channel itself.
+    mid = await find_latest_counter_message_id(search_channel)
+    if mid is not None:
+        channel_latest_counter[search_channel_id] = mid  # warm the cache for next time
+        return active_counters[mid]
+    return None
 
-    counts = state.get_user_counts(target.id)
-    lines = []
-    for button_id in INTERACTIVE_BUTTON_IDS:
-        cfg = BUTTON_CONFIG[button_id]
-        emoji = f"{cfg['emoji']} " if cfg.get("emoji") else ""
-
-        last = state.get_last_click(target.id, button_id)
-        if last is None:
-            last_text = "never clicked"
-        else:
-            last_text = f"{discord.utils.format_dt(last, style='R')} ({discord.utils.format_dt(last, style='f')})"
-
-        if cfg.get("toggle", False):
-            # Toggle state is per-user now — this shows the target user's
-            # own On/Off status, and when they last flipped it either way.
-            state_word = "On" if state.get_toggle_state(target.id, button_id) else "Off"
-            lines.append(f"{emoji}**{cfg['label']}:** {state_word} — last toggled {last_text}")
-            continue
-
-        value = counts[button_id]
-        if value is not None:
-            soft, lifetime = value
-            if lifetime is not None:
-                lines.append(
-                    f"{emoji}**{cfg['label']}:** {soft} (lifetime: {lifetime}) — last click: {last_text}"
-                )
-            else:
-                # track_lifetime is disabled for this button — soft count only.
-                lines.append(f"{emoji}**{cfg['label']}:** {soft} — last click: {last_text}")
-        else:
-            # Timer-only button: no count at all, just the last-click time.
-            lines.append(f"{emoji}**{cfg['label']}:** last click: {last_text}")
-
-    embed = discord.Embed(
-        title=f"📊 Stats for {target.display_name}",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(
-    name="unlock_bot",
-    description="If you're the tracked user, immediately let the bot's AI replies work normally again",
-)
-async def unlock_bot_command(interaction: discord.Interaction):
-    global _tracked_user_last_seen
-
-    if TRACKED_USER_ID is None:
-        await interaction.response.send_message(
-            "The tracked-user referral feature isn't configured (no `TRACKED_USER_ID` set).",
-            ephemeral=True,
-        )
-        return
-    if interaction.user.id != TRACKED_USER_ID:
-        await interaction.response.send_message(
-            "Only Goddess Myra can use this command.", ephemeral=True
-        )
-        return
-
-    _tracked_user_last_seen = None
-    await interaction.response.send_message(
-        "🔓 Unlocked — AI replies will work normally until you post again.", ephemeral=True
-    )
 
 @bot.event
 async def on_ready():
@@ -785,6 +873,8 @@ async def on_message(message: discord.Message):
 
     if message.author.bot or message.author.id == bot.user.id:
         return
+    if message.guild is None:
+        return  # ignore DMs — only respond in server channels
 
     # Track the specific user's activity on EVERY message they send,
     # regardless of whether it's a reply/mention or the AI feature is even
@@ -815,8 +905,6 @@ async def on_message(message: discord.Message):
 
     if replied_to is None and not is_mention:
         return  # neither a reply to us nor a mention of us — ignore
-    if message.guild is None:
-        return  # do not reply to DMs
 
     # Simple per-user cooldown to keep this from being spammed / running up
     # API costs — set it up-front so rapid-fire messages don't all queue up.
@@ -887,6 +975,185 @@ async def on_message(message: discord.Message):
         await message.reply(reply_text, mention_author=False)
     except (discord.Forbidden, discord.HTTPException) as e:
         print(f"Couldn't send AI reply: {e}")
+
+
+@bot.tree.command(name="counter", description="Post a new click counter with configured buttons")
+async def counter_command(interaction: discord.Interaction):
+    if not has_counter_admin_permission(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command."
+        )
+        return
+
+    state = CounterState()
+    view = CounterView(state)
+
+    if BANNER_PATH.exists():
+        banner_file = discord.File(BANNER_PATH, filename=BANNER_FILENAME)
+        await interaction.response.send_message(view=view, file=banner_file)
+    else:
+        await interaction.response.send_message(view=view)
+
+    sent_message = await interaction.original_response()
+    active_counters[sent_message.id] = state
+    channel_latest_counter[interaction.channel_id] = sent_message.id
+
+
+@bot.tree.command(name="counts", description="See a user's counts and last-click times on a counter")
+@app_commands.describe(
+    user="Whose info to look up (defaults to you)",
+    counter="Optional: paste a specific counter message link/ID (defaults to the latest one in this channel)",
+)
+async def counts_command(
+        interaction: discord.Interaction,
+        user: Optional[discord.Member] = None,
+        counter: Optional[str] = None,
+):
+    if not has_counter_admin_permission(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command."
+        )
+        return
+
+    target = user or interaction.user
+    state = await resolve_state(interaction, counter)
+    if state is None:
+        await interaction.response.send_message(
+            "I couldn't find a counter here. Run `/counter` first, or pass a specific "
+            "counter message link/ID with the `counter` option."
+        )
+        return
+
+    counts = state.get_user_counts(target.id)
+    lines = []
+    for button_id in INTERACTIVE_BUTTON_IDS:
+        cfg = BUTTON_CONFIG[button_id]
+        emoji = f"{cfg['emoji']} " if cfg.get("emoji") else ""
+
+        last = state.get_last_click(target.id, button_id)
+        if last is None:
+            last_text = "never clicked"
+        else:
+            last_text = f"{discord.utils.format_dt(last, style='R')} ({discord.utils.format_dt(last, style='f')})"
+
+        if cfg.get("toggle", False):
+            # Toggle state is per-user now — this shows the target user's
+            # own On/Off status, and when they last flipped it either way.
+            state_word = "On" if state.get_toggle_state(target.id, button_id) else "Off"
+            lines.append(f"{emoji}**{cfg['label']}:** {state_word} — last toggled {last_text}")
+            continue
+
+        value = counts[button_id]
+        if value is not None:
+            soft, lifetime = value
+            if lifetime is not None:
+                lines.append(
+                    f"{emoji}**{cfg['label']}:** {soft} (lifetime: {lifetime}) — last click: {last_text}"
+                )
+            else:
+                # track_lifetime is disabled for this button — soft count only.
+                lines.append(f"{emoji}**{cfg['label']}:** {soft} — last click: {last_text}")
+        else:
+            # Timer-only button: no count at all, just the last-click time.
+            lines.append(f"{emoji}**{cfg['label']}:** last click: {last_text}")
+
+    embed = discord.Embed(
+        title=f"📊 Stats for {target.display_name}",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(
+    name="unlock_bot",
+    description="If you're the tracked user, immediately let the bot's AI replies work normally again",
+)
+async def unlock_bot_command(interaction: discord.Interaction):
+    global _tracked_user_last_seen
+
+    if TRACKED_USER_ID is None:
+        await interaction.response.send_message(
+            "The tracked-user referral feature isn't configured (no `TRACKED_USER_ID` set)."
+        )
+        return
+    if interaction.user.id != TRACKED_USER_ID:
+        await interaction.response.send_message(
+            "Only the tracked user can use this command."
+        )
+        return
+
+    _tracked_user_last_seen = None
+    await interaction.response.send_message(
+        "🔓 Unlocked — AI replies will work normally until you post again."
+    )
+
+
+async def countable_button_autocomplete(interaction: discord.Interaction, current: str):
+    """Only offer buttons that actually track a count — not toggles,
+    timer-only, or link buttons."""
+    current = current.lower()
+    choices = []
+    for button_id in INTERACTIVE_BUTTON_IDS:
+        cfg = BUTTON_CONFIG[button_id]
+        if cfg.get("toggle", False) or not cfg.get("track_count", True):
+            continue
+        if current in cfg["label"].lower() or current in button_id:
+            choices.append(app_commands.Choice(name=f"{cfg['label']} ({button_id})", value=button_id))
+    return choices[:25]
+
+
+@bot.tree.command(name="set_count", description="Manually set a user's count on a button")
+@app_commands.describe(
+    user="Whose count to set",
+    button="Which button's count to set",
+    count="New count",
+    counter="Optional: paste a specific counter message link/ID (defaults to the latest one in this channel)",
+)
+@app_commands.autocomplete(button=countable_button_autocomplete)
+async def set_count_command(
+        interaction: discord.Interaction,
+        user: discord.Member,
+        button: str,
+        count: int,
+        counter: Optional[str] = None,
+):
+    if not has_counter_admin_permission(interaction):
+        await interaction.response.send_message(
+            "You don't have permission to use this command."
+        )
+        return
+
+    state = await resolve_state(interaction, counter)
+    if state is None:
+        await interaction.response.send_message(
+            "I couldn't find a counter here. Run `/counter` first, or pass a specific "
+            "counter message link/ID with the `counter` option."
+        )
+        return
+
+    if button not in BUTTON_CONFIG:
+        await interaction.response.send_message(
+            f"Unknown button `{button}`. Use the autocomplete list to pick a valid one."
+        )
+        return
+
+    cfg = BUTTON_CONFIG[button]
+    if button in LINK_BUTTON_IDS or cfg.get("toggle", False) or not cfg.get("track_count", True):
+        await interaction.response.send_message(
+            f"**{cfg['label']}** doesn't track a count (it's a link, toggle, or timer-only button)."
+        )
+        return
+
+    if count < 0:
+        await interaction.response.send_message("Counts can't be negative.")
+        return
+
+    state.set_user_count(user.id, button, count)
+
+    confirmation = f"✅ Set **{user.display_name}**'s **{cfg['label']}** count to **{count}**"
+    await interaction.response.send_message(confirmation)
+
 
 if __name__ == "__main__":
     if not TOKEN:
