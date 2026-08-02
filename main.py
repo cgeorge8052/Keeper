@@ -737,7 +737,7 @@ class CounterView(discord.ui.LayoutView):
         async def _schedule_delete(msg):
             if delete_after and msg is not None:
                 try:
-                    await msg.delete(delay=delete_after)
+                    do_nothing = 1
                 except (discord.Forbidden, discord.HTTPException, discord.NotFound) as e:
                     print(f"Couldn't schedule deletion for a button {button_id} broadcast message: {e}")
 
