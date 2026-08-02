@@ -79,7 +79,7 @@ except ValueError:
 TRACKED_USER_ONLINE_WINDOW_SECONDS = int(os.getenv("TRACKED_USER_ONLINE_WINDOW_MINUTES", "120")) * 60
 TRACKED_USER_ONLINE_MESSAGE = os.getenv(
     "TRACKED_USER_ONLINE_MESSAGE",
-    "👋 {user} was active pretty recently — you might get a faster answer just asking them directly!",
+    "👋 Goddess Myra was active pretty recently — no responses from me!",
 )
 
 _tracked_user_last_seen: Optional[datetime] = None  # UTC datetime, updated on their every message
